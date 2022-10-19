@@ -24,15 +24,22 @@ const uuidv4 = require('uuid/v4');
                 continue;
             }
 
+            const refundedQty = getRefundedQty(order, orderData.sku);
+            if (!refundedQty) {
+                console.log(`${orderData.orderNumber} Refunded Status not found`);
+                continue;
+            }
+
             await updateReundedStatusesToReverseCharge(orderData.orderNumber, refundedStatuses);
             await insertOrderlineStatus(orderData.orderNumber, {
                 status: 'Shipped',
                 sku: orderData.sku,
-                qty: 1,
+                qty: refundedQty,
                 source: getWarehouseFromSku(order, orderData.sku)
             });
             console.log(`${orderData.orderNumber} ${orderData.sku} Resetted Refunded to Shipped Status`);
 
+            //move processed file to done
             await fs.promises.rename(file, `./batch/done/${path.parse(file).base}`);
         }
     }
@@ -43,6 +50,14 @@ function getWarehouseFromSku(order, sku) {
     const warehouse = orderDetails.OrderLines.find(orderline => orderline.Sku === sku).StockAllocation;
 
     return warehouse;
+}
+
+function getRefundedQty(order, sku) {
+    const refundedStatus = order.find(item => {
+        return item.AttributeId.startsWith(`OrderLine#Status#${sku}`) && item.Status === "Refunded";
+    });
+
+    return refundedStatus.Qty;
 }
 
 
