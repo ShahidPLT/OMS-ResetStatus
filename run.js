@@ -5,6 +5,11 @@ const path = require("path");
 const csv = require("fast-csv");
 const uuidv4 = require('uuid/v4');
 
+const { isAnyItemsRefunded } = require('./functions/is-any-items-refunded.function');
+const { isAllItemsShipped } = require('./functions/is-all-items-shipped.function');
+
+const allowReverseShippingRefunded = true;
+
 (async () => {
     const entries = await fg(["./batch/*.csv"], { dot: false });
     for (const file of entries) {
@@ -12,15 +17,18 @@ const uuidv4 = require('uuid/v4');
         const data = await readCsv(file);
 
         for (const orderData of data) {
+            let activityMerge = [];
             const order = await getOrder(orderData.orderNumber);
+            const orderDetails = getOrderDetails(order);
 
             if (!order) {
                 console.log(`${orderData.orderNumber} Order Number not found`);
                 continue;
             }
+
             const refundedStatuses = getRefundedStatuses(order, orderData.sku);
             if (!refundedStatuses.length) {
-                console.log(`${orderData.orderNumber} Refunded Statuses not found`);
+                console.log(`${orderData.orderNumber} Refund Statuses not found`);
                 continue;
             }
 
@@ -30,6 +38,7 @@ const uuidv4 = require('uuid/v4');
                 continue;
             }
 
+            // Update existing refund orderline statuses and then insert orderline Shipped status
             await updateReundedStatusesToReverseCharge(orderData.orderNumber, refundedStatuses);
             await insertOrderlineStatus(orderData.orderNumber, {
                 status: 'Shipped',
@@ -37,6 +46,34 @@ const uuidv4 = require('uuid/v4');
                 qty: refundedQty,
                 source: getWarehouseFromSku(order, orderData.sku)
             });
+            activityMerge.push(`Reset orderline Cancelled to Shipped (${orderData.sku}) QTY: ${parseInt(refundedQty, 10)}`);
+
+            // check if order status needs updating to Shipped
+            const orderStatus = getOrderDetails(order).OrderStatus;
+            if (orderStatus === "Partial Refund Processed") {
+                const orderRecheck = await getOrder(orderData.orderNumber);
+                if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
+                    await updateOrderStatus(orderData.orderNumber, 'Shipped')
+                }
+            }
+
+
+            if (orderStatus === "Cancelled") {
+                const isShippingRefunded = orderDetails.ShippingRefunded && orderDetails.ShippingRefunded === "Yes";
+                if (isShippingRefunded && allowReverseShippingRefunded) {
+                    await updateNoShippingRefunded(orderData.orderNumber);
+                    activityMerge.push("Reverse Refund Shipping Charge");
+                }
+
+                const orderRecheck = await getOrder(orderData.orderNumber);
+                if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
+                    await updateOrderStatus(orderData.orderNumber, 'Shipped')
+                }
+            }
+
+            if (activityMerge.length > 0) {
+                await insertLog(orderData.orderNumber, activityMerge.join("\n"));
+            }
             console.log(`${orderData.orderNumber} ${orderData.sku} Resetted Refunded to Shipped Status`);
 
             //move processed file to done
@@ -137,6 +174,46 @@ async function updateOrderlineStatus(orderNumber, attributeId, status) {
     return documentClient.update(params).promise();
 }
 
+async function updateOrderStatus(orderNumber, status) {
+    const documentClient = new aws.DynamoDB.DocumentClient();
+    const params = {
+        TableName: "OrdersV3",
+        Key: {
+            OrderId: orderNumber,
+            AttributeId: 'Details'
+        },
+        UpdateExpression: "SET #Status = :status",
+        ExpressionAttributeValues: {
+            ":status": status
+        },
+        ExpressionAttributeNames: {
+            "#Status": "OrderStatus"
+        }
+    };
+
+    return documentClient.update(params).promise();
+}
+
+async function updateNoShippingRefunded(orderNumber) {
+    const documentClient = new aws.DynamoDB.DocumentClient();
+    const params = {
+        TableName: "OrdersV3",
+        Key: {
+            OrderId: orderNumber,
+            AttributeId: 'Details'
+        },
+        UpdateExpression: "SET #ShippingRefunded = :value",
+        ExpressionAttributeValues: {
+            ":value": 'No'
+        },
+        ExpressionAttributeNames: {
+            "#ShippingRefunded": "ShippingRefunded"
+        }
+    };
+
+    return documentClient.update(params).promise();
+}
+
 async function insertOrderlineStatus(orderNumber, statusData) {
     const documentClient = new aws.DynamoDB.DocumentClient();
     const hash = uuidv4().substring(0, 5);
@@ -155,4 +232,28 @@ async function insertOrderlineStatus(orderNumber, statusData) {
     }
 
     await documentClient.put(params).promise();
+}
+
+
+async function insertLog(orderNumber, comment) {
+    const documentClient = new aws.DynamoDB.DocumentClient();
+    const params = {
+        TableName: "OrdersLogs",
+        Item: {
+            Id: uuidv4(),
+            OrderId: orderNumber,
+            CreatedAt: new Date().toISOString(),
+            User: 'System',
+            Type: 'Shipment',
+            Comment: comment,
+            UserId: null,
+            LogData: {},
+        },
+    }
+
+    await documentClient.put(params).promise();
+}
+
+function getOrderDetails(order) {
+    return order.find(item => item.AttributeId === "Details");
 }
