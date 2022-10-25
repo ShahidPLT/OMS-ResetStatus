@@ -1,4 +1,4 @@
-process.env.AWS_PROFILE = "plt-staging"
+//process.env.AWS_PROFILE = "plt-staging"
 process.env.AWS_REGION = "eu-west-1"
 
 const aws = require("aws-sdk");
@@ -86,9 +86,10 @@ const allowReverseShippingRefunded = true;
                 console.log(`${orderData.orderNumber} ${orderDataSku} Resetted Orderline to Shipped Status`);
             }
 
-            //move processed file to done
-            await fs.promises.rename(file, `./batch/done/${path.parse(file).base}`);
         }
+
+        //move processed file to done
+        await fs.promises.rename(file, `./batch/done/${path.parse(file).base}`);
     }
 })();
 
