@@ -1,3 +1,6 @@
+process.env.AWS_PROFILE = "plt-staging"
+process.env.AWS_REGION = "eu-west-1"
+
 const aws = require("aws-sdk");
 const fg = require("fast-glob");
 const fs = require("fs");
@@ -17,64 +20,71 @@ const allowReverseShippingRefunded = true;
         const data = await readCsv(file);
 
         for (const orderData of data) {
-            let activityMerge = [];
             const order = await getOrder(orderData.orderNumber);
-            const orderDetails = getOrderDetails(order);
 
             if (!order) {
                 console.log(`${orderData.orderNumber} Order Number not found`);
                 continue;
             }
+            const orderDetails = getOrderDetails(order);
+            const orderDataSkus = orderData.sku.split(',');
 
-            const refundedStatuses = getRefundedStatuses(order, orderData.sku);
-            if (!refundedStatuses.length) {
-                console.log(`${orderData.orderNumber} Refund Statuses not found`);
-                continue;
-            }
-
-            const refundedQty = getRefundedQty(order, orderData.sku);
-            if (!refundedQty) {
-                console.log(`${orderData.orderNumber} Refunded Status not found`);
-                continue;
-            }
-
-            // Update existing refund orderline statuses and then insert orderline Shipped status
-            await updateReundedStatusesToReverseCharge(orderData.orderNumber, refundedStatuses);
-            await insertOrderlineStatus(orderData.orderNumber, {
-                status: 'Shipped',
-                sku: orderData.sku,
-                qty: refundedQty,
-                source: getWarehouseFromSku(order, orderData.sku)
-            });
-            activityMerge.push(`Reset orderline Cancelled to Shipped (${orderData.sku}) QTY: ${parseInt(refundedQty, 10)}`);
-
-            // check if order status needs updating to Shipped
-            const orderStatus = getOrderDetails(order).OrderStatus;
-            if (orderStatus === "Partial Refund Processed") {
-                const orderRecheck = await getOrder(orderData.orderNumber);
-                if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
-                    await updateOrderStatus(orderData.orderNumber, 'Shipped')
-                }
-            }
-
-
-            if (orderStatus === "Cancelled") {
-                const isShippingRefunded = orderDetails.ShippingRefunded && orderDetails.ShippingRefunded === "Yes";
-                if (isShippingRefunded && allowReverseShippingRefunded) {
-                    await updateNoShippingRefunded(orderData.orderNumber);
-                    activityMerge.push("Reverse Refund Shipping Charge");
+            // Loop through each SKU from row
+            for (const orderDataSku of orderDataSkus) {
+                let activityMerge = [];
+                const refundedStatuses = getRefundedStatuses(order, orderDataSku);
+                if (!refundedStatuses.length) {
+                    console.log(`${orderData.orderNumber} ${orderDataSku} Refund Statuses not found ('Refund Requested', 'Refund Pending', 'Refunded')`);
+                    continue;
                 }
 
-                const orderRecheck = await getOrder(orderData.orderNumber);
-                if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
-                    await updateOrderStatus(orderData.orderNumber, 'Shipped')
-                }
-            }
+                const refundedQty = getRefundedQty(order, orderDataSku);
+                const financeCancelledQty = getFinanceCancelledQty(order, orderDataSku);
 
-            if (activityMerge.length > 0) {
-                await insertLog(orderData.orderNumber, activityMerge.join("\n"));
+                if (!refundedQty && !financeCancelledQty) {
+                    console.log(`${orderData.orderNumber} ${orderDataSku} Refunded Status or Finance Cancelled Status not found`);
+                    continue;
+                }
+
+
+                // Update existing refund orderline statuses and then insert orderline Shipped status
+                await updateReundedStatusesToReverseCharge(orderData.orderNumber, refundedStatuses);
+                await insertOrderlineStatus(orderData.orderNumber, {
+                    status: 'Shipped',
+                    sku: orderDataSku,
+                    qty: refundedQty || financeCancelledQty,
+                    source: getWarehouseFromSku(order, orderDataSku)
+                });
+                activityMerge.push(`Reset orderline Cancelled to Shipped (${orderDataSku}) QTY: ${parseInt(refundedQty || financeCancelledQty, 10)}`);
+
+                // check if order status needs updating to Shipped
+                const orderStatus = getOrderDetails(order).OrderStatus;
+                if (orderStatus === "Partial Refund Processed") {
+                    const orderRecheck = await getOrder(orderData.orderNumber);
+                    if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
+                        await updateOrderStatus(orderData.orderNumber, 'Shipped')
+                    }
+                }
+
+
+                if (orderStatus === "Cancelled" || orderStatus === "Packing") {
+                    const isShippingRefunded = orderDetails.ShippingRefunded && orderDetails.ShippingRefunded === "Yes";
+                    if (isShippingRefunded && allowReverseShippingRefunded) {
+                        await updateNoShippingRefunded(orderData.orderNumber);
+                        activityMerge.push("Reverse Refund Shipping Charge");
+                    }
+
+                    const orderRecheck = await getOrder(orderData.orderNumber);
+                    if (!isAnyItemsRefunded(orderRecheck) && isAllItemsShipped(orderRecheck)) {
+                        await updateOrderStatus(orderData.orderNumber, 'Shipped')
+                    }
+                }
+
+                if (activityMerge.length > 0) {
+                    await insertLog(orderData.orderNumber, activityMerge.join("\n"));
+                }
+                console.log(`${orderData.orderNumber} ${orderDataSku} Resetted Orderline to Shipped Status`);
             }
-            console.log(`${orderData.orderNumber} ${orderData.sku} Resetted Refunded to Shipped Status`);
 
             //move processed file to done
             await fs.promises.rename(file, `./batch/done/${path.parse(file).base}`);
@@ -92,11 +102,18 @@ function getWarehouseFromSku(order, sku) {
 function getRefundedQty(order, sku) {
     const refundedStatus = order.find(item => {
         return item.AttributeId.startsWith(`OrderLine#Status#${sku}`) && item.Status === "Refunded";
-    });
+    }) || {};
 
-    return refundedStatus.Qty;
+    return refundedStatus.Qty || false;
 }
 
+function getFinanceCancelledQty(order, sku) {
+    const financeCancelledStatus = order.find(item => {
+        return item.AttributeId.startsWith(`OrderLine#Status#${sku}`) && item.Status === "Finance Cancelled";
+    }) || {};
+
+    return financeCancelledStatus.Qty || false;
+}
 
 async function readCsv(filepath) {
     const data = [];
